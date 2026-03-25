@@ -1,4 +1,6 @@
 import os
+os.system("python -m playwright install chromium")
+
 import re
 import time
 import json
@@ -264,8 +266,8 @@ def main_menu_keyboard():
             [{"text": "📋 عرض الكلمات"}, {"text": "⏱ تغيير وقت الفحص"}],
             [{"text": "▶️ تشغيل الرصد"}, {"text": "⏸ إيقاف الرصد"}],
             [{"text": "📊 الحالة"}, {"text": "📈 الإحصائيات"}],
-            [{"text": "🔐 تسجيل دخول X"}, {"text": "🧪 اختبار الإرسال"}],
-            [{"text": "🗑 مسح السجل"}, {"text": "❌ إلغاء"}]
+            [{"text": "🧪 اختبار الإرسال"}, {"text": "🗑 مسح السجل"}],
+            [{"text": "❌ إلغاء"}]
         ],
         "resize_keyboard": True,
         "is_persistent": True
@@ -301,13 +303,6 @@ def send_target_video(video_url, caption):
 # PLAYWRIGHT / X
 # =========================
 def login_x_and_save_state():
-    """
-    شغّلها محليًا مرة واحدة فقط:
-    python main.py login
-    وسيفتح المتصفح.
-    بعد ما تسجل الدخول يدويًا إلى X،
-    اضغط Enter في التيرمنال ليحفظ الجلسة.
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context()
@@ -322,16 +317,18 @@ def login_x_and_save_state():
 
 def search_x_with_playwright(keyword, limit=10):
     if not os.path.exists(STATE_FILE):
-        raise RuntimeError("ملف x_state.json غير موجود. شغّل: python main.py login")
+        raise RuntimeError("ملف x_state.json غير موجود")
 
     results = []
-
     query = f'({keyword}) filter:videos'
     search_url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=STATE_FILE, viewport={"width": 1280, "height": 2200})
+        context = browser.new_context(
+            storage_state=STATE_FILE,
+            viewport={"width": 1280, "height": 2200}
+        )
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(5000)
@@ -340,42 +337,60 @@ def search_x_with_playwright(keyword, limit=10):
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2500)
 
-        html = page.content()
+        articles = page.locator("article")
+        count = min(articles.count(), limit)
+
+        for i in range(count):
+            article = articles.nth(i)
+
+            try:
+                links = article.locator('a[href*="/status/"]')
+                if links.count() == 0:
+                    continue
+
+                href = links.first.get_attribute("href")
+                if not href or "/status/" not in href:
+                    continue
+
+                full_url = "https://x.com" + href
+                post_id_match = re.search(r"/status/(\d+)", href)
+                if not post_id_match:
+                    continue
+                post_id = post_id_match.group(1)
+
+                text = ""
+                text_nodes = article.locator('div[lang]')
+                if text_nodes.count() > 0:
+                    parts = []
+                    for j in range(text_nodes.count()):
+                        t = text_nodes.nth(j).inner_text().strip()
+                        if t:
+                            parts.append(t)
+                    text = "\n".join(parts).strip()
+
+                created_at = None
+                time_node = article.locator("time")
+                if time_node.count() > 0:
+                    created_at = time_node.first.get_attribute("datetime")
+
+                video_url = None
+                html = article.inner_html()
+                mp4s = re.findall(r'https://video\.twimg\.com/[^"\']+\.mp4[^"\']*', html)
+                if mp4s:
+                    video_url = mp4s[0].replace("&amp;", "&")
+
+                results.append({
+                    "id": post_id,
+                    "text": text or "منشور جديد مطابق للكلمة",
+                    "url": full_url,
+                    "video_url": video_url,
+                    "date": created_at or now_iso()
+                })
+
+            except Exception as e:
+                print("ARTICLE PARSE ERROR:", e)
+
         browser.close()
-
-    tweet_links = list(dict.fromkeys(re.findall(r'href="(/[^"/]+/status/\d+)"', html)))
-
-    for link in tweet_links[:limit]:
-        full_url = "https://x.com" + link
-        post_id_match = re.search(r"/status/(\d+)", link)
-        if not post_id_match:
-            continue
-        post_id = post_id_match.group(1)
-
-        text_match = re.search(
-            rf'href="{re.escape(link)}".*?</a>.*?<div[^>]*lang="[^"]+"[^>]*>(.*?)</div>',
-            html,
-            re.DOTALL
-        )
-        text = ""
-        if text_match:
-            text = re.sub(r"<.*?>", "", text_match.group(1))
-            text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
-
-        # محاولة التقاط mp4 مباشر إن وجد
-        video_url = None
-        around = html[max(0, html.find(link) - 15000): html.find(link) + 15000] if link in html else html
-        mp4s = re.findall(r'https://video\.twimg\.com/[^"\']+\.mp4[^"\']*', around)
-        if mp4s:
-            video_url = mp4s[0].replace("&amp;", "&")
-
-        results.append({
-            "id": post_id,
-            "text": text or "منشور جديد مطابق للكلمة",
-            "url": full_url,
-            "video_url": video_url,
-            "date": now_iso()
-        })
 
     return results
 
@@ -497,16 +512,6 @@ def handle_menu_text(chat_id, text):
         send_message(chat_id, stats_text(), with_menu=True)
         return
 
-    if text == "🔐 تسجيل دخول X":
-        send_message(
-            chat_id,
-            "نفّذ هذه الخطوة محليًا أو على جهازك:\n\npython main.py login\n\n"
-            "سيفتح المتصفح، سجّل الدخول يدويًا إلى X، ثم اضغط Enter في التيرمنال.\n"
-            "بعدها ارفع ملف x_state.json إلى المشروع.",
-            with_menu=True
-        )
-        return
-
     if text == "🧪 اختبار الإرسال":
         send_target_message("✅ اختبار ناجح: البوت يرسل بشكل صحيح.")
         send_message(chat_id, "تم إرسال رسالة اختبار.", with_menu=True)
@@ -587,11 +592,19 @@ def process_keywords():
                 if already_sent(post_id):
                     continue
 
-                item_date = parse_iso(item["date"])
-                if item_date < activated_at:
+                tweet_date_str = item.get("date")
+                if not tweet_date_str:
                     continue
 
-                caption = f"{item['text']}\n\n{item['url']}\n\nKeyword: {keyword}"
+                tweet_date = parse_iso(tweet_date_str)
+                if tweet_date <= activated_at:
+                    continue
+
+                caption = (
+                    f"{item['text']}\n\n"
+                    f"رابط المنشور:\n{item['url']}\n\n"
+                    f"Keyword: {keyword}"
+                )
 
                 if item.get("video_url"):
                     try:
@@ -602,7 +615,13 @@ def process_keywords():
                     except Exception as send_err:
                         print("VIDEO SEND ERROR:", send_err)
 
-                msg_result = send_target_message(caption)
+                fallback_text = (
+                    f"{item['text']}\n\n"
+                    f"رابط المنشور:\n{item['url']}\n\n"
+                    f"رابط الفيديو المباشر:\n{item.get('video_url', 'غير متوفر')}\n\n"
+                    f"Keyword: {keyword}"
+                )
+                msg_result = send_target_message(fallback_text)
                 if msg_result.get("ok"):
                     mark_sent(post_id, keyword)
 
