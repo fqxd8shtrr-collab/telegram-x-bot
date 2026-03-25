@@ -1,2 +1,2 @@
 requests
-twscrape==0.17.0
+playwright
