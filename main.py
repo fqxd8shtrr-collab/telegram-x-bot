@@ -3,12 +3,12 @@ import re
 import time
 import json
 import sqlite3
-import hashlib
 import threading
-import subprocess
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
+from playwright.sync_api import sync_playwright
 
 # =========================
 # ENV
@@ -17,11 +17,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 CHECK_INTERVAL_DEFAULT = int(os.getenv("CHECK_INTERVAL", "15"))
 CONTROL_CHAT_ID = os.getenv("CONTROL_CHAT_ID", "").strip()
-ACCOUNTS_TEXT = os.getenv("ACCOUNTS_TEXT", "").strip()
 
 DB_FILE = "data.db"
-TWS_DB = "accounts.db"
-ACCOUNTS_FILE = "accounts.txt"
+STATE_FILE = "x_state.json"
 
 
 # =========================
@@ -82,7 +80,6 @@ def init_db():
     upsert_bot_state("total_sent", "0")
     upsert_bot_state("last_scan_at", "")
     upsert_bot_state("last_error", "")
-    upsert_bot_state("accounts_hash", "")
 
     conn.commit()
     conn.close()
@@ -267,8 +264,7 @@ def main_menu_keyboard():
             [{"text": "📋 عرض الكلمات"}, {"text": "⏱ تغيير وقت الفحص"}],
             [{"text": "▶️ تشغيل الرصد"}, {"text": "⏸ إيقاف الرصد"}],
             [{"text": "📊 الحالة"}, {"text": "📈 الإحصائيات"}],
-            [{"text": "👥 حالة الحسابات"}, {"text": "🔄 إعادة تهيئة الحسابات"}],
-            [{"text": "🔐 إعادة تسجيل الفاشلة"}, {"text": "🧪 اختبار الإرسال"}],
+            [{"text": "🔐 تسجيل دخول X"}, {"text": "🧪 اختبار الإرسال"}],
             [{"text": "🗑 مسح السجل"}, {"text": "❌ إلغاء"}]
         ],
         "resize_keyboard": True,
@@ -302,183 +298,86 @@ def send_target_video(video_url, caption):
 
 
 # =========================
-# TWSCRAPE
+# PLAYWRIGHT / X
 # =========================
-def run_cmd(cmd, timeout=180):
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        raise RuntimeError(stderr or stdout or "command failed")
-    return result.stdout
+def login_x_and_save_state():
+    """
+    شغّلها محليًا مرة واحدة فقط:
+    python main.py login
+    وسيفتح المتصفح.
+    بعد ما تسجل الدخول يدويًا إلى X،
+    اضغط Enter في التيرمنال ليحفظ الجلسة.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=120000)
+        print("سجّل الدخول يدويًا داخل المتصفح، ثم ارجع للتيرمنال واضغط Enter...")
+        input()
+        context.storage_state(path=STATE_FILE)
+        browser.close()
+        print(f"تم حفظ الجلسة في {STATE_FILE}")
 
 
-def tws_cmd(*args):
-    return ["twscrape", "--db", TWS_DB, *args]
+def search_x_with_playwright(keyword, limit=10):
+    if not os.path.exists(STATE_FILE):
+        raise RuntimeError("ملف x_state.json غير موجود. شغّل: python main.py login")
 
+    results = []
 
-def write_accounts_file():
-    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-        f.write(ACCOUNTS_TEXT + "\n")
-
-
-def accounts_hash():
-    return hashlib.sha256(ACCOUNTS_TEXT.encode("utf-8")).hexdigest()
-
-
-def bootstrap_accounts(force=False):
-    if not ACCOUNTS_TEXT:
-        return "لا توجد حسابات في ACCOUNTS_TEXT."
-
-    new_hash = accounts_hash()
-    old_hash = get_bot_state("accounts_hash", "")
-
-    if (new_hash == old_hash) and not force:
-        return "الحسابات مهيأة مسبقًا."
-
-    write_accounts_file()
-
-    out1 = run_cmd(
-        tws_cmd(
-            "add_accounts",
-            ACCOUNTS_FILE,
-            "username:password:email:email_password"
-        ),
-        timeout=300
-    )
-    print("ADD_ACCOUNTS OUTPUT:", out1)
-
-    out2 = run_cmd(tws_cmd("login_accounts"), timeout=1200)
-    print("LOGIN_ACCOUNTS OUTPUT:", out2)
-
-    upsert_bot_state("accounts_hash", new_hash)
-    return "تمت تهيئة الحسابات وتسجيل دخولها."
-
-
-def relogin_failed_accounts():
-    try:
-        out = run_cmd(tws_cmd("relogin_failed"), timeout=1200)
-        print("RELOGIN OUTPUT:", out)
-        return out or "تم تنفيذ relogin_failed."
-    except Exception as e:
-        print("RELOGIN ERROR:", str(e))
-        return f"RELOGIN ERROR: {str(e)}"
-
-
-def get_accounts_status():
-    out = run_cmd(tws_cmd("accounts"), timeout=120)
-    print("ACCOUNTS STATUS OUTPUT:", out)
-    return out.strip() or "لا توجد بيانات."
-
-
-def parse_search_output(raw_text):
-    raw_text = raw_text.strip()
-    if not raw_text:
-        return []
-
-    items = []
-
-    if raw_text.startswith("["):
-        try:
-            data = json.loads(raw_text)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            items.append(json.loads(line))
-        except Exception:
-            continue
-    return items
-
-
-def search_x_free(keyword, limit=10):
     query = f'({keyword}) filter:videos'
-    out = run_cmd(tws_cmd("search", query, f"--limit={limit}"), timeout=240)
-    print(f"SEARCH OUTPUT [{keyword}]:", out[:2000])
-    return parse_search_output(out)
+    search_url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
 
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(storage_state=STATE_FILE, viewport={"width": 1280, "height": 2200})
+        page = context.new_page()
+        page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(5000)
 
-def get_tweet_id(item):
-    for key in ("id", "tweetId", "rest_id"):
-        val = item.get(key)
-        if val:
-            return str(val)
-    return None
+        for _ in range(3):
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2500)
 
+        html = page.content()
+        browser.close()
 
-def get_tweet_text(item):
-    for key in ("rawContent", "content", "full_text", "text"):
-        val = item.get(key)
-        if val:
-            return str(val)
-    return ""
+    tweet_links = list(dict.fromkeys(re.findall(r'href="(/[^"/]+/status/\d+)"', html)))
 
+    for link in tweet_links[:limit]:
+        full_url = "https://x.com" + link
+        post_id_match = re.search(r"/status/(\d+)", link)
+        if not post_id_match:
+            continue
+        post_id = post_id_match.group(1)
 
-def get_tweet_date(item):
-    for key in ("date", "created_at", "createdAt"):
-        val = item.get(key)
-        if val:
-            try:
-                return parse_iso(str(val))
-            except Exception:
-                return None
-    return None
+        text_match = re.search(
+            rf'href="{re.escape(link)}".*?</a>.*?<div[^>]*lang="[^"]+"[^>]*>(.*?)</div>',
+            html,
+            re.DOTALL
+        )
+        text = ""
+        if text_match:
+            text = re.sub(r"<.*?>", "", text_match.group(1))
+            text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
 
+        # محاولة التقاط mp4 مباشر إن وجد
+        video_url = None
+        around = html[max(0, html.find(link) - 15000): html.find(link) + 15000] if link in html else html
+        mp4s = re.findall(r'https://video\.twimg\.com/[^"\']+\.mp4[^"\']*', around)
+        if mp4s:
+            video_url = mp4s[0].replace("&amp;", "&")
 
-def get_tweet_url(item):
-    username = None
-    if isinstance(item.get("user"), dict):
-        username = item["user"].get("username") or item["user"].get("login")
+        results.append({
+            "id": post_id,
+            "text": text or "منشور جديد مطابق للكلمة",
+            "url": full_url,
+            "video_url": video_url,
+            "date": now_iso()
+        })
 
-    tweet_id = get_tweet_id(item)
-
-    if username and tweet_id:
-        return f"https://x.com/{username}/status/{tweet_id}"
-    if tweet_id:
-        return f"https://x.com/i/web/status/{tweet_id}"
-    return ""
-
-
-def extract_video_url(item):
-    media = item.get("media") or {}
-    possible_urls = []
-
-    if isinstance(media, dict):
-        videos = media.get("videos") or media.get("video")
-        if isinstance(videos, list):
-            for v in videos:
-                if isinstance(v, dict):
-                    u = v.get("url")
-                    if u:
-                        possible_urls.append(u)
-        elif isinstance(videos, dict):
-            u = videos.get("url")
-            if u:
-                possible_urls.append(u)
-
-    raw = json.dumps(item, ensure_ascii=False)
-    mp4s = re.findall(r'https?://[^\s"\\]+\.mp4[^\s"\\]*', raw)
-    possible_urls.extend(mp4s)
-
-    seen = set()
-    unique = []
-    for u in possible_urls:
-        if u not in seen:
-            seen.add(u)
-            unique.append(u)
-
-    return unique[0] if unique else None
+    return results
 
 
 # =========================
@@ -490,6 +389,7 @@ def status_text():
     paused = "متوقف" if is_paused() else "يعمل"
     last_scan_at = get_bot_state("last_scan_at", "") or "غير متوفر"
     last_error = get_bot_state("last_error", "") or "لا يوجد"
+    login_state = "موجودة" if os.path.exists(STATE_FILE) else "غير موجودة"
 
     return (
         f"📊 حالة البوت\n\n"
@@ -497,6 +397,7 @@ def status_text():
         f"وقت الفحص: {interval} ثانية\n"
         f"عدد الكلمات: {len(rows)}\n"
         f"وجهة الإرسال: {CHAT_ID}\n"
+        f"جلسة X: {login_state}\n"
         f"آخر فحص: {last_scan_at}\n"
         f"آخر خطأ: {last_error}"
     )
@@ -596,28 +497,14 @@ def handle_menu_text(chat_id, text):
         send_message(chat_id, stats_text(), with_menu=True)
         return
 
-    if text == "👥 حالة الحسابات":
-        try:
-            out = get_accounts_status()
-            send_message(chat_id, f"👥 حالة الحسابات\n\n{out}", with_menu=True)
-        except Exception as e:
-            send_message(chat_id, f"فشل قراءة حالة الحسابات:\n{str(e)[:300]}", with_menu=True)
-        return
-
-    if text == "🔄 إعادة تهيئة الحسابات":
-        try:
-            msg = bootstrap_accounts(force=True)
-            send_message(chat_id, msg, with_menu=True)
-        except Exception as e:
-            send_message(chat_id, f"فشل تهيئة الحسابات:\n{str(e)[:300]}", with_menu=True)
-        return
-
-    if text == "🔐 إعادة تسجيل الفاشلة":
-        try:
-            out = relogin_failed_accounts()
-            send_message(chat_id, f"{out[:3500]}", with_menu=True)
-        except Exception as e:
-            send_message(chat_id, f"فشل إعادة التسجيل:\n{str(e)[:300]}", with_menu=True)
+    if text == "🔐 تسجيل دخول X":
+        send_message(
+            chat_id,
+            "نفّذ هذه الخطوة محليًا أو على جهازك:\n\npython main.py login\n\n"
+            "سيفتح المتصفح، سجّل الدخول يدويًا إلى X، ثم اضغط Enter في التيرمنال.\n"
+            "بعدها ارفع ملف x_state.json إلى المشروع.",
+            with_menu=True
+        )
         return
 
     if text == "🧪 اختبار الإرسال":
@@ -678,6 +565,11 @@ def process_keywords():
     if is_paused():
         return
 
+    if not os.path.exists(STATE_FILE):
+        upsert_bot_state("last_error", "ملف x_state.json غير موجود")
+        upsert_bot_state("last_scan_at", now_iso())
+        return
+
     rows = list_keywords()
     if not rows:
         upsert_bot_state("last_scan_at", now_iso())
@@ -688,29 +580,22 @@ def process_keywords():
         activated_at = parse_iso(row["activated_at"])
 
         try:
-            tweets = search_x_free(keyword, limit=10)
-            tweets = list(reversed(tweets))
+            tweets = search_x_with_playwright(keyword, limit=10)
 
-            for item in tweets:
-                post_id = get_tweet_id(item)
-                if not post_id:
-                    continue
+            for item in reversed(tweets):
+                post_id = item["id"]
                 if already_sent(post_id):
                     continue
 
-                tweet_date = get_tweet_date(item)
-                if tweet_date and tweet_date < activated_at:
+                item_date = parse_iso(item["date"])
+                if item_date < activated_at:
                     continue
 
-                text = get_tweet_text(item)
-                post_url = get_tweet_url(item)
-                caption = f"{text}\n\n{post_url}\n\nKeyword: {keyword}".strip()
+                caption = f"{item['text']}\n\n{item['url']}\n\nKeyword: {keyword}"
 
-                video_url = extract_video_url(item)
-
-                if video_url:
+                if item.get("video_url"):
                     try:
-                        result = send_target_video(video_url, caption)
+                        result = send_target_video(item["video_url"], caption)
                         if result.get("ok"):
                             mark_sent(post_id, keyword)
                             continue
@@ -722,8 +607,8 @@ def process_keywords():
                     mark_sent(post_id, keyword)
 
         except Exception as e:
-            upsert_bot_state("last_error", f"TWS [{keyword}]: {str(e)[:180]}")
-            print(f"TWS ERROR [{keyword}]:", e)
+            upsert_bot_state("last_error", f"X [{keyword}]: {str(e)[:180]}")
+            print(f"X ERROR [{keyword}]:", e)
 
     upsert_bot_state("last_scan_at", now_iso())
 
@@ -748,13 +633,6 @@ def main():
 
     init_db()
 
-    try:
-        msg = bootstrap_accounts(force=False)
-        print(msg)
-    except Exception as e:
-        upsert_bot_state("last_error", f"BOOTSTRAP: {str(e)[:180]}")
-        print("BOOTSTRAP ERROR:", e)
-
     t1 = threading.Thread(target=poll_telegram, daemon=True)
     t2 = threading.Thread(target=monitor_loop, daemon=True)
     t1.start()
@@ -765,4 +643,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "login":
+        login_x_and_save_state()
+    else:
+        main()
