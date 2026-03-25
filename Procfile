@@ -1,1 +1,1 @@
-worker: python -m playwright install && python main.py
+worker: apt-get update && apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 libxcomposite1 libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libgtk-3-0 libxdamage1 libxfixes3 libxext6 libx11-6 && python -m playwright install chromium && python main.py
