@@ -1,6 +1,4 @@
 import os
-os.system("python -m playwright install chromium")
-
 import re
 import time
 import json
@@ -25,20 +23,28 @@ STATE_FILE = "x_state.json"
 
 
 # =========================
-# DB
+# HELPERS
 # =========================
-def db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
 def parse_iso(dt_str: str):
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
+
+def safe_text(text: str, max_len: int) -> str:
+    text = text or ""
+    return text[:max_len]
+
+
+# =========================
+# DB
+# =========================
+def db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
@@ -76,12 +82,21 @@ def init_db():
         )
     """)
 
-    upsert_bot_state("check_interval", str(CHECK_INTERVAL_DEFAULT))
-    upsert_bot_state("is_paused", "0")
-    upsert_bot_state("update_offset", "0")
-    upsert_bot_state("total_sent", "0")
-    upsert_bot_state("last_scan_at", "")
-    upsert_bot_state("last_error", "")
+    defaults = {
+        "check_interval": str(CHECK_INTERVAL_DEFAULT),
+        "is_paused": "0",
+        "update_offset": "0",
+        "total_sent": "0",
+        "last_scan_at": "",
+        "last_error": "",
+        "session_status": "unknown",
+        "session_last_check": "",
+        "last_found_count": "0",
+        "last_sent_count": "0",
+    }
+
+    for k, v in defaults.items():
+        upsert_bot_state(k, v)
 
     conn.commit()
     conn.close()
@@ -94,7 +109,7 @@ def upsert_bot_state(key, value):
         INSERT INTO bot_state (key, value)
         VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, value))
+    """, (key, str(value)))
     conn.commit()
     conn.close()
 
@@ -204,7 +219,7 @@ def mark_sent(post_id, keyword):
     conn.close()
 
     total_sent = int(get_bot_state("total_sent", "0"))
-    upsert_bot_state("total_sent", str(total_sent + 1))
+    upsert_bot_state("total_sent", total_sent + 1)
 
 
 def clear_sent_posts():
@@ -220,7 +235,7 @@ def get_update_offset():
 
 
 def set_update_offset(offset):
-    upsert_bot_state("update_offset", str(offset))
+    upsert_bot_state("update_offset", offset)
 
 
 def is_admin_chat(chat_id):
@@ -266,6 +281,7 @@ def main_menu_keyboard():
             [{"text": "📋 عرض الكلمات"}, {"text": "⏱ تغيير وقت الفحص"}],
             [{"text": "▶️ تشغيل الرصد"}, {"text": "⏸ إيقاف الرصد"}],
             [{"text": "📊 الحالة"}, {"text": "📈 الإحصائيات"}],
+            [{"text": "🔎 فحص الجلسة"}, {"text": "♻️ إعادة تحميل الجلسة"}],
             [{"text": "🧪 اختبار الإرسال"}, {"text": "🗑 مسح السجل"}],
             [{"text": "❌ إلغاء"}]
         ],
@@ -276,7 +292,7 @@ def main_menu_keyboard():
 
 
 def send_message(chat_id, text, with_menu=False):
-    data = {"chat_id": str(chat_id), "text": text[:4096]}
+    data = {"chat_id": str(chat_id), "text": safe_text(text, 4096)}
     if with_menu:
         data["reply_markup"] = main_menu_keyboard()
     return tg_api("sendMessage", data)
@@ -286,7 +302,7 @@ def send_video(chat_id, video_url, caption):
     data = {
         "chat_id": str(chat_id),
         "video": video_url,
-        "caption": caption[:1024]
+        "caption": safe_text(caption, 1024)
     }
     return tg_api("sendVideo", data)
 
@@ -302,17 +318,53 @@ def send_target_video(video_url, caption):
 # =========================
 # PLAYWRIGHT / X
 # =========================
-def login_x_and_save_state():
+def check_session_status():
+    if not os.path.exists(STATE_FILE):
+        upsert_bot_state("session_status", "missing")
+        upsert_bot_state("session_last_check", now_iso())
+        return False, "ملف x_state.json غير موجود"
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            storage_state=STATE_FILE,
+            viewport={"width": 1280, "height": 1200}
+        )
         page = context.new_page()
-        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=120000)
-        print("سجّل الدخول يدويًا داخل المتصفح، ثم ارجع للتيرمنال واضغط Enter...")
-        input()
-        context.storage_state(path=STATE_FILE)
-        browser.close()
-        print(f"تم حفظ الجلسة في {STATE_FILE}")
+
+        try:
+            page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(4000)
+
+            current_url = page.url.lower()
+            html = page.content().lower()
+
+            if "login" in current_url or "/i/flow/login" in current_url:
+                upsert_bot_state("session_status", "expired")
+                upsert_bot_state("session_last_check", now_iso())
+                browser.close()
+                return False, "الجلسة منتهية أو تحتاج تسجيل دخول"
+
+            if "sign in" in html or "log in" in html:
+                upsert_bot_state("session_status", "expired")
+                upsert_bot_state("session_last_check", now_iso())
+                browser.close()
+                return False, "الجلسة غير صالحة"
+
+            upsert_bot_state("session_status", "ok")
+            upsert_bot_state("session_last_check", now_iso())
+            browser.close()
+            return True, "الجلسة شغالة"
+
+        except Exception as e:
+            upsert_bot_state("session_status", "error")
+            upsert_bot_state("session_last_check", now_iso())
+            upsert_bot_state("last_error", f"SESSION CHECK: {str(e)[:180]}")
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return False, f"فشل فحص الجلسة: {str(e)[:120]}"
 
 
 def search_x_with_playwright(keyword, limit=10):
@@ -332,6 +384,11 @@ def search_x_with_playwright(keyword, limit=10):
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(5000)
+
+        print(f"CURRENT URL FOR [{keyword}]: {page.url}")
+        if "login" in page.url.lower() or "/i/flow/login" in page.url.lower():
+            browser.close()
+            raise RuntimeError("SESSION EXPIRED OR LOGIN REQUIRED")
 
         for _ in range(3):
             page.mouse.wheel(0, 3000)
@@ -405,6 +462,10 @@ def status_text():
     last_scan_at = get_bot_state("last_scan_at", "") or "غير متوفر"
     last_error = get_bot_state("last_error", "") or "لا يوجد"
     login_state = "موجودة" if os.path.exists(STATE_FILE) else "غير موجودة"
+    session_status = get_bot_state("session_status", "unknown")
+    session_last_check = get_bot_state("session_last_check", "") or "غير متوفر"
+    last_found = get_bot_state("last_found_count", "0")
+    last_sent = get_bot_state("last_sent_count", "0")
 
     return (
         f"📊 حالة البوت\n\n"
@@ -412,8 +473,12 @@ def status_text():
         f"وقت الفحص: {interval} ثانية\n"
         f"عدد الكلمات: {len(rows)}\n"
         f"وجهة الإرسال: {CHAT_ID}\n"
-        f"جلسة X: {login_state}\n"
-        f"آخر فحص: {last_scan_at}\n"
+        f"ملف الجلسة: {login_state}\n"
+        f"حالة الجلسة: {session_status}\n"
+        f"آخر فحص للجلسة: {session_last_check}\n"
+        f"آخر فحص عام: {last_scan_at}\n"
+        f"آخر عدد نتائج: {last_found}\n"
+        f"آخر عدد إرسال: {last_sent}\n"
         f"آخر خطأ: {last_error}"
     )
 
@@ -512,6 +577,16 @@ def handle_menu_text(chat_id, text):
         send_message(chat_id, stats_text(), with_menu=True)
         return
 
+    if text == "🔎 فحص الجلسة":
+        ok, msg = check_session_status()
+        send_message(chat_id, msg, with_menu=True)
+        return
+
+    if text == "♻️ إعادة تحميل الجلسة":
+        ok, msg = check_session_status()
+        send_message(chat_id, f"تمت إعادة فحص الجلسة.\n\n{msg}", with_menu=True)
+        return
+
     if text == "🧪 اختبار الإرسال":
         send_target_message("✅ اختبار ناجح: البوت يرسل بشكل صحيح.")
         send_message(chat_id, "تم إرسال رسالة اختبار.", with_menu=True)
@@ -567,25 +642,39 @@ def poll_telegram():
 
 
 def process_keywords():
+    print("PROCESS_KEYWORDS RUNNING")
+
     if is_paused():
+        print("MONITOR PAUSED")
         return
 
     if not os.path.exists(STATE_FILE):
+        upsert_bot_state("session_status", "missing")
         upsert_bot_state("last_error", "ملف x_state.json غير موجود")
         upsert_bot_state("last_scan_at", now_iso())
         return
 
     rows = list_keywords()
     if not rows:
+        print("NO KEYWORDS SAVED")
         upsert_bot_state("last_scan_at", now_iso())
+        upsert_bot_state("last_found_count", "0")
+        upsert_bot_state("last_sent_count", "0")
         return
+
+    total_found = 0
+    total_sent_now = 0
 
     for row in rows:
         keyword = row["keyword"]
         activated_at = parse_iso(row["activated_at"])
 
         try:
+            print(f"Scanning keyword: {keyword}")
             tweets = search_x_with_playwright(keyword, limit=10)
+            print(f"Found {len(tweets)} tweets for: {keyword}")
+
+            total_found += len(tweets)
 
             for item in reversed(tweets):
                 post_id = item["id"]
@@ -611,6 +700,8 @@ def process_keywords():
                         result = send_target_video(item["video_url"], caption)
                         if result.get("ok"):
                             mark_sent(post_id, keyword)
+                            total_sent_now += 1
+                            print(f"SENT VIDEO POST: {post_id}")
                             continue
                     except Exception as send_err:
                         print("VIDEO SEND ERROR:", send_err)
@@ -624,12 +715,21 @@ def process_keywords():
                 msg_result = send_target_message(fallback_text)
                 if msg_result.get("ok"):
                     mark_sent(post_id, keyword)
+                    total_sent_now += 1
+                    print(f"SENT FALLBACK POST: {post_id}")
+
+            upsert_bot_state("session_status", "ok")
 
         except Exception as e:
-            upsert_bot_state("last_error", f"X [{keyword}]: {str(e)[:180]}")
+            msg = str(e)
+            if "SESSION EXPIRED OR LOGIN REQUIRED" in msg:
+                upsert_bot_state("session_status", "expired")
+            upsert_bot_state("last_error", f"X [{keyword}]: {msg[:180]}")
             print(f"X ERROR [{keyword}]:", e)
 
     upsert_bot_state("last_scan_at", now_iso())
+    upsert_bot_state("last_found_count", str(total_found))
+    upsert_bot_state("last_sent_count", str(total_sent_now))
 
 
 def monitor_loop():
@@ -650,7 +750,16 @@ def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing required environment variables.")
 
+    print("BOT STARTED")
+    print("STATE FILE EXISTS:", os.path.exists(STATE_FILE))
+
     init_db()
+
+    try:
+        ok, msg = check_session_status()
+        print("INITIAL SESSION CHECK:", msg)
+    except Exception as e:
+        print("INITIAL SESSION CHECK ERROR:", e)
 
     t1 = threading.Thread(target=poll_telegram, daemon=True)
     t2 = threading.Thread(target=monitor_loop, daemon=True)
@@ -662,8 +771,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "login":
-        login_x_and_save_state()
-    else:
-        main()
+    main()
