@@ -1,23 +1,33 @@
 import os
+import re
 import time
 import json
+import shlex
 import sqlite3
+import hashlib
 import threading
+import subprocess
 from datetime import datetime, timezone
 
 import requests
 
-
 # =========================
 # ENV
 # =========================
-BEARER_TOKEN = os.getenv("BEARER_TOKEN", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # مكان إرسال النتائج
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # وجهة إرسال النتائج
 CHECK_INTERVAL_DEFAULT = int(os.getenv("CHECK_INTERVAL", "15"))
-CONTROL_CHAT_ID = os.getenv("CONTROL_CHAT_ID", "").strip()  # اختياري: آيديك للتحكم فقط
+CONTROL_CHAT_ID = os.getenv("CONTROL_CHAT_ID", "").strip()  # اختياري: من يتحكم بالبوت فقط
 
+# حسابات twscrape: كل سطر بصيغة:
+# username:password:email:email_password
+# ويمكنك وضع عدة أسطر
+ACCOUNTS_TEXT = os.getenv("ACCOUNTS_TEXT", "").strip()
+
+# ملفات محلية
 DB_FILE = "data.db"
+TWS_DB = "accounts.db"
+ACCOUNTS_FILE = "accounts.txt"
 
 
 # =========================
@@ -27,6 +37,14 @@ def db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(dt_str: str):
+    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
 
 def init_db():
@@ -64,10 +82,13 @@ def init_db():
         )
     """)
 
-    # إعدادات افتراضية
     upsert_bot_state("check_interval", str(CHECK_INTERVAL_DEFAULT))
     upsert_bot_state("is_paused", "0")
     upsert_bot_state("update_offset", "0")
+    upsert_bot_state("total_sent", "0")
+    upsert_bot_state("last_scan_at", "")
+    upsert_bot_state("last_error", "")
+    upsert_bot_state("accounts_hash", "")
 
     conn.commit()
     conn.close()
@@ -170,6 +191,15 @@ def list_keywords():
     return rows
 
 
+def already_sent(post_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sent_posts WHERE post_id = ?", (post_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def mark_sent(post_id, keyword):
     conn = db()
     cur = conn.cursor()
@@ -180,14 +210,16 @@ def mark_sent(post_id, keyword):
     conn.commit()
     conn.close()
 
+    total_sent = int(get_bot_state("total_sent", "0"))
+    upsert_bot_state("total_sent", str(total_sent + 1))
 
-def already_sent(post_id):
+
+def clear_sent_posts():
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_posts WHERE post_id = ?", (post_id,))
-    row = cur.fetchone()
+    cur.execute("DELETE FROM sent_posts")
+    conn.commit()
     conn.close()
-    return row is not None
 
 
 def get_update_offset():
@@ -196,17 +228,6 @@ def get_update_offset():
 
 def set_update_offset(offset):
     upsert_bot_state("update_offset", str(offset))
-
-
-# =========================
-# HELPERS
-# =========================
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_iso(dt_str):
-    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
 
 def is_admin_chat(chat_id):
@@ -239,10 +260,7 @@ def tg_api(method, data=None):
 
 def tg_get_updates():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {
-        "timeout": 30,
-        "offset": get_update_offset()
-    }
+    params = {"timeout": 30, "offset": get_update_offset()}
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     return r.json()
@@ -254,8 +272,10 @@ def main_menu_keyboard():
             [{"text": "➕ إضافة كلمة"}, {"text": "➖ حذف كلمة"}],
             [{"text": "📋 عرض الكلمات"}, {"text": "⏱ تغيير وقت الفحص"}],
             [{"text": "▶️ تشغيل الرصد"}, {"text": "⏸ إيقاف الرصد"}],
-            [{"text": "📊 الحالة"}, {"text": "🧪 اختبار الإرسال"}],
-            [{"text": "❌ إلغاء"}]
+            [{"text": "📊 الحالة"}, {"text": "📈 الإحصائيات"}],
+            [{"text": "👥 حالة الحسابات"}, {"text": "🔄 إعادة تهيئة الحسابات"}],
+            [{"text": "🔐 إعادة تسجيل الفاشلة"}, {"text": "🧪 اختبار الإرسال"}],
+            [{"text": "🗑 مسح السجل"}, {"text": "❌ إلغاء"}]
         ],
         "resize_keyboard": True,
         "is_persistent": True
@@ -264,10 +284,7 @@ def main_menu_keyboard():
 
 
 def send_message(chat_id, text, with_menu=False):
-    data = {
-        "chat_id": str(chat_id),
-        "text": text[:4096]
-    }
+    data = {"chat_id": str(chat_id), "text": text[:4096]}
     if with_menu:
         data["reply_markup"] = main_menu_keyboard()
     return tg_api("sendMessage", data)
@@ -291,150 +308,224 @@ def send_target_video(video_url, caption):
 
 
 # =========================
-# X SEARCH
+# TWSCRAPE HELPERS
 # =========================
-def search_x(keyword):
-    url = "https://api.x.com/2/tweets/search/recent"
-    headers = {
-        "Authorization": "Bearer " + BEARER_TOKEN
-    }
-    params = {
-        "query": f'({keyword}) has:videos -is:retweet',
-        "max_results": 10,
-        "tweet.fields": "created_at,attachments,text,author_id",
-        "expansions": "attachments.media_keys",
-        "media.fields": "type,preview_image_url,variants"
-    }
-
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def run_cmd(cmd, timeout=180):
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        raise RuntimeError(stderr or stdout or "command failed")
+    return result.stdout
 
 
-def extract_best_video_url(response_json, tweet):
-    includes = response_json.get("includes", {})
-    media_list = includes.get("media", [])
-    media_map = {m["media_key"]: m for m in media_list if "media_key" in m}
+def tws_cmd(*args):
+    return ["twscrape", "--db", TWS_DB, *args]
 
-    attachments = tweet.get("attachments", {})
-    media_keys = attachments.get("media_keys", [])
 
-    best_video_url = None
-    best_bitrate = -1
+def write_accounts_file():
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        f.write(ACCOUNTS_TEXT + "\n")
 
-    for key in media_keys:
-        media = media_map.get(key)
-        if not media:
+
+def accounts_hash():
+    return hashlib.sha256(ACCOUNTS_TEXT.encode("utf-8")).hexdigest()
+
+
+def bootstrap_accounts(force=False):
+    """
+    يضيف الحسابات من ACCOUNTS_TEXT ويجري login_accounts مرة واحدة عند التغيير.
+    صيغة كل سطر:
+    username:password:email:email_password
+    """
+    if not ACCOUNTS_TEXT:
+        return "لا توجد حسابات في ACCOUNTS_TEXT."
+
+    new_hash = accounts_hash()
+    old_hash = get_bot_state("accounts_hash", "")
+
+    if (new_hash == old_hash) and not force:
+        return "الحسابات مهيأة مسبقًا."
+
+    write_accounts_file()
+
+    # add_accounts <file_path> <line_format>
+    run_cmd(
+        tws_cmd(
+            "add_accounts",
+            ACCOUNTS_FILE,
+            "username:password:email:email_password"
+        ),
+        timeout=300
+    )
+
+    # login_accounts
+    run_cmd(tws_cmd("login_accounts"), timeout=1200)
+
+    upsert_bot_state("accounts_hash", new_hash)
+    return "تمت تهيئة الحسابات وتسجيل دخولها."
+
+
+def relogin_failed_accounts():
+    out = run_cmd(tws_cmd("relogin_failed"), timeout=1200)
+    return out or "تم تنفيذ relogin_failed."
+
+
+def get_accounts_status():
+    """
+    twscrape accounts
+    """
+    out = run_cmd(tws_cmd("accounts"), timeout=120)
+    return out.strip() or "لا توجد بيانات."
+
+
+def search_x_free(keyword, limit=10):
+    """
+    twscrape search "QUERY" --limit=20
+    الإخراج: JSON lines
+    """
+    query = f'({keyword}) filter:videos'
+    out = run_cmd(tws_cmd("search", query, f"--limit={limit}"), timeout=240)
+    return parse_search_output(out)
+
+
+def parse_search_output(raw_text):
+    raw_text = raw_text.strip()
+    if not raw_text:
+        return []
+
+    items = []
+    # أحيانًا يكون JSON array
+    if raw_text.startswith("["):
+        try:
+            data = json.loads(raw_text)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+
+    # الغالب: JSON لكل سطر
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
             continue
-
-        if media.get("type") != "video":
+        try:
+            items.append(json.loads(line))
+        except Exception:
             continue
+    return items
 
-        variants = media.get("variants", [])
-        for variant in variants:
-            url = variant.get("url")
-            content_type = variant.get("content_type", "")
-            bitrate = variant.get("bit_rate", 0)
 
-            if not url:
-                continue
-            if "video/mp4" not in content_type:
-                continue
+def get_tweet_id(item):
+    for key in ("id", "tweetId", "rest_id"):
+        val = item.get(key)
+        if val:
+            return str(val)
+    return None
 
-            if bitrate > best_bitrate:
-                best_bitrate = bitrate
-                best_video_url = url
 
-    return best_video_url
+def get_tweet_text(item):
+    for key in ("rawContent", "content", "full_text", "text"):
+        val = item.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def get_tweet_date(item):
+    for key in ("date", "created_at", "createdAt"):
+        val = item.get(key)
+        if val:
+            try:
+                return parse_iso(str(val))
+            except Exception:
+                return None
+    return None
+
+
+def get_tweet_url(item):
+    username = None
+    if isinstance(item.get("user"), dict):
+        username = item["user"].get("username") or item["user"].get("login")
+
+    tweet_id = get_tweet_id(item)
+
+    if username and tweet_id:
+        return f"https://x.com/{username}/status/{tweet_id}"
+    if tweet_id:
+        return f"https://x.com/i/web/status/{tweet_id}"
+    return ""
+
+
+def extract_video_url(item):
+    """
+    يحاول استخراج رابط mp4 مباشر إن كان موجودًا في media.
+    """
+    media = item.get("media") or {}
+    possible_urls = []
+
+    if isinstance(media, dict):
+        videos = media.get("videos") or media.get("video")
+        if isinstance(videos, list):
+            for v in videos:
+                if isinstance(v, dict):
+                    u = v.get("url")
+                    if u:
+                        possible_urls.append(u)
+        elif isinstance(videos, dict):
+            u = videos.get("url")
+            if u:
+                possible_urls.append(u)
+
+    raw = json.dumps(item, ensure_ascii=False)
+    mp4s = re.findall(r'https?://[^\s"\\]+\.mp4[^\s"\\]*', raw)
+    possible_urls.extend(mp4s)
+
+    seen = set()
+    unique = []
+    for u in possible_urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+
+    return unique[0] if unique else None
 
 
 # =========================
-# BOT UI / ACTIONS
+# BOT UI
 # =========================
 def status_text():
     rows = list_keywords()
     interval = get_check_interval()
     paused = "متوقف" if is_paused() else "يعمل"
+    last_scan_at = get_bot_state("last_scan_at", "") or "غير متوفر"
+    last_error = get_bot_state("last_error", "") or "لا يوجد"
+
     return (
         f"📊 حالة البوت\n\n"
         f"الحالة: {paused}\n"
         f"وقت الفحص: {interval} ثانية\n"
         f"عدد الكلمات: {len(rows)}\n"
-        f"وجهة الإرسال: {CHAT_ID}"
+        f"وجهة الإرسال: {CHAT_ID}\n"
+        f"آخر فحص: {last_scan_at}\n"
+        f"آخر خطأ: {last_error}"
     )
 
 
-def handle_menu_text(chat_id, text):
-    text = (text or "").strip()
-
-    if text == "/start":
-        clear_user_pending_action(chat_id)
-        send_message(
-            chat_id,
-            "مرحبًا بك.\nاختر من الأزرار بالأسفل:",
-            with_menu=True
-        )
-        return
-
-    if text == "➕ إضافة كلمة":
-        set_user_pending_action(chat_id, "add_keyword")
-        send_message(chat_id, "أرسل الآن الكلمة أو الجملة التي تريد إضافتها.", with_menu=True)
-        return
-
-    if text == "➖ حذف كلمة":
-        set_user_pending_action(chat_id, "remove_keyword")
-        send_message(chat_id, "أرسل الآن الكلمة التي تريد حذفها بالضبط.", with_menu=True)
-        return
-
-    if text == "📋 عرض الكلمات":
-        rows = list_keywords()
-        if not rows:
-            send_message(chat_id, "لا توجد كلمات محفوظة.", with_menu=True)
-            return
-
-        msg = "📋 الكلمات الحالية:\n\n"
-        for row in rows:
-            msg += f"- {row['keyword']}\n"
-        send_message(chat_id, msg, with_menu=True)
-        return
-
-    if text == "⏱ تغيير وقت الفحص":
-        set_user_pending_action(chat_id, "set_interval")
-        send_message(chat_id, "أرسل الوقت بالثواني.\nمثال: 5", with_menu=True)
-        return
-
-    if text == "▶️ تشغيل الرصد":
-        set_paused(False)
-        send_message(chat_id, "تم تشغيل الرصد.", with_menu=True)
-        return
-
-    if text == "⏸ إيقاف الرصد":
-        set_paused(True)
-        send_message(chat_id, "تم إيقاف الرصد.", with_menu=True)
-        return
-
-    if text == "📊 الحالة":
-        send_message(chat_id, status_text(), with_menu=True)
-        return
-
-    if text == "🧪 اختبار الإرسال":
-        send_target_message("✅ اختبار ناجح: البوت يرسل بشكل صحيح.")
-        send_message(chat_id, "تم إرسال رسالة اختبار إلى الوجهة المحددة.", with_menu=True)
-        return
-
-    if text == "❌ إلغاء" or text == "/cancel":
-        clear_user_pending_action(chat_id)
-        send_message(chat_id, "تم إلغاء العملية.", with_menu=True)
-        return
-
-    # إذا كان المستخدم داخل خطوة انتظار
-    pending = get_user_pending_action(chat_id)
-    if pending:
-        handle_pending_action(chat_id, pending, text)
-        return
-
-    # غير معروف
-    send_message(chat_id, "اختر من الأزرار بالأسفل.", with_menu=True)
+def stats_text():
+    rows = list_keywords()
+    total_sent = get_bot_state("total_sent", "0")
+    return (
+        f"📈 الإحصائيات\n\n"
+        f"عدد الكلمات المحفوظة: {len(rows)}\n"
+        f"إجمالي المنشورات المرسلة: {total_sent}\n"
+        f"وقت الفحص الحالي: {get_check_interval()} ثانية"
+    )
 
 
 def handle_pending_action(chat_id, pending, text):
@@ -454,12 +545,12 @@ def handle_pending_action(chat_id, pending, text):
 
     if pending == "set_interval":
         if not text.isdigit():
-            send_message(chat_id, "أرسل رقمًا فقط.\nمثال: 5", with_menu=True)
+            send_message(chat_id, "أرسل رقمًا فقط. مثال: 5", with_menu=True)
             return
 
         seconds = int(text)
-        if seconds < 3:
-            send_message(chat_id, "الحد الأدنى الموصى به هو 3 ثوانٍ.", with_menu=True)
+        if seconds < 5:
+            send_message(chat_id, "الحد الأدنى هنا 5 ثوانٍ.", with_menu=True)
             return
 
         upsert_bot_state("check_interval", str(seconds))
@@ -468,8 +559,107 @@ def handle_pending_action(chat_id, pending, text):
         return
 
 
+def handle_menu_text(chat_id, text):
+    text = (text or "").strip()
+
+    if text == "/start":
+        clear_user_pending_action(chat_id)
+        send_message(chat_id, "مرحبًا بك.\nاختر من الأزرار بالأسفل:", with_menu=True)
+        return
+
+    if text == "➕ إضافة كلمة":
+        set_user_pending_action(chat_id, "add_keyword")
+        send_message(chat_id, "أرسل الآن الكلمة أو الجملة التي تريد إضافتها.", with_menu=True)
+        return
+
+    if text == "➖ حذف كلمة":
+        set_user_pending_action(chat_id, "remove_keyword")
+        send_message(chat_id, "أرسل الآن الكلمة التي تريد حذفها بالضبط.", with_menu=True)
+        return
+
+    if text == "📋 عرض الكلمات":
+        rows = list_keywords()
+        if not rows:
+            send_message(chat_id, "لا توجد كلمات محفوظة.", with_menu=True)
+            return
+        msg = "📋 الكلمات الحالية:\n\n"
+        for row in rows:
+            msg += f"- {row['keyword']}\n"
+        send_message(chat_id, msg, with_menu=True)
+        return
+
+    if text == "⏱ تغيير وقت الفحص":
+        set_user_pending_action(chat_id, "set_interval")
+        send_message(chat_id, "أرسل الوقت بالثواني. مثال: 10", with_menu=True)
+        return
+
+    if text == "▶️ تشغيل الرصد":
+        set_paused(False)
+        send_message(chat_id, "تم تشغيل الرصد.", with_menu=True)
+        return
+
+    if text == "⏸ إيقاف الرصد":
+        set_paused(True)
+        send_message(chat_id, "تم إيقاف الرصد.", with_menu=True)
+        return
+
+    if text == "📊 الحالة":
+        send_message(chat_id, status_text(), with_menu=True)
+        return
+
+    if text == "📈 الإحصائيات":
+        send_message(chat_id, stats_text(), with_menu=True)
+        return
+
+    if text == "👥 حالة الحسابات":
+        try:
+            out = get_accounts_status()
+            send_message(chat_id, f"👥 حالة الحسابات\n\n{out}", with_menu=True)
+        except Exception as e:
+            send_message(chat_id, f"فشل قراءة حالة الحسابات:\n{str(e)[:300]}", with_menu=True)
+        return
+
+    if text == "🔄 إعادة تهيئة الحسابات":
+        try:
+            msg = bootstrap_accounts(force=True)
+            send_message(chat_id, msg, with_menu=True)
+        except Exception as e:
+            send_message(chat_id, f"فشل تهيئة الحسابات:\n{str(e)[:300]}", with_menu=True)
+        return
+
+    if text == "🔐 إعادة تسجيل الفاشلة":
+        try:
+            out = relogin_failed_accounts()
+            send_message(chat_id, f"تم تنفيذ إعادة تسجيل الفاشلة.\n\n{out[:3500]}", with_menu=True)
+        except Exception as e:
+            send_message(chat_id, f"فشل إعادة التسجيل:\n{str(e)[:300]}", with_menu=True)
+        return
+
+    if text == "🧪 اختبار الإرسال":
+        send_target_message("✅ اختبار ناجح: البوت يرسل بشكل صحيح.")
+        send_message(chat_id, "تم إرسال رسالة اختبار.", with_menu=True)
+        return
+
+    if text == "🗑 مسح السجل":
+        clear_sent_posts()
+        send_message(chat_id, "تم مسح سجل المنشورات المرسلة.", with_menu=True)
+        return
+
+    if text == "❌ إلغاء" or text == "/cancel":
+        clear_user_pending_action(chat_id)
+        send_message(chat_id, "تم إلغاء العملية.", with_menu=True)
+        return
+
+    pending = get_user_pending_action(chat_id)
+    if pending:
+        handle_pending_action(chat_id, pending, text)
+        return
+
+    send_message(chat_id, "اختر من الأزرار بالأسفل.", with_menu=True)
+
+
 # =========================
-# POLL TELEGRAM
+# TELEGRAM LOOP
 # =========================
 def poll_telegram():
     while True:
@@ -493,6 +683,7 @@ def poll_telegram():
                 handle_menu_text(chat_id, text)
 
         except Exception as e:
+            upsert_bot_state("last_error", f"TELEGRAM: {str(e)[:180]}")
             print("TELEGRAM ERROR:", e)
 
         time.sleep(2)
@@ -507,6 +698,7 @@ def process_keywords():
 
     rows = list_keywords()
     if not rows:
+        upsert_bot_state("last_scan_at", now_iso())
         return
 
     for row in rows:
@@ -514,30 +706,25 @@ def process_keywords():
         activated_at = parse_iso(row["activated_at"])
 
         try:
-            data = search_x(keyword)
-            tweets = data.get("data", [])
+            tweets = search_x_free(keyword, limit=10)
             tweets = list(reversed(tweets))  # الأقدم أولًا
 
-            for tweet in tweets:
-                post_id = tweet["id"]
+            for item in tweets:
+                post_id = get_tweet_id(item)
+                if not post_id:
+                    continue
                 if already_sent(post_id):
                     continue
 
-                created_at_str = tweet.get("created_at")
-                if not created_at_str:
+                tweet_date = get_tweet_date(item)
+                if tweet_date and tweet_date < activated_at:
                     continue
 
-                created_at = parse_iso(created_at_str)
+                text = get_tweet_text(item)
+                post_url = get_tweet_url(item)
+                caption = f"{text}\n\n{post_url}\n\nKeyword: {keyword}".strip()
 
-                # لا يرسل إلا ما نُشر بعد وقت إضافة الكلمة
-                if created_at < activated_at:
-                    continue
-
-                post_url = f"https://x.com/i/web/status/{post_id}"
-                text = tweet.get("text", "")
-                caption = f"{text}\n\n{post_url}\n\nKeyword: {keyword}"
-
-                video_url = extract_best_video_url(data, tweet)
+                video_url = extract_video_url(item)
 
                 if video_url:
                     try:
@@ -548,16 +735,15 @@ def process_keywords():
                     except Exception as send_err:
                         print("VIDEO SEND ERROR:", send_err)
 
-                # fallback
-                try:
-                    msg_result = send_target_message(caption)
-                    if msg_result.get("ok"):
-                        mark_sent(post_id, keyword)
-                except Exception as msg_err:
-                    print("MESSAGE SEND ERROR:", msg_err)
+                msg_result = send_target_message(caption)
+                if msg_result.get("ok"):
+                    mark_sent(post_id, keyword)
 
         except Exception as e:
-            print(f"X ERROR [{keyword}]:", e)
+            upsert_bot_state("last_error", f"TWS [{keyword}]: {str(e)[:180]}")
+            print(f"TWS ERROR [{keyword}]:", e)
+
+    upsert_bot_state("last_scan_at", now_iso())
 
 
 def monitor_loop():
@@ -565,6 +751,7 @@ def monitor_loop():
         try:
             process_keywords()
         except Exception as e:
+            upsert_bot_state("last_error", f"MONITOR: {str(e)[:180]}")
             print("MONITOR ERROR:", e)
 
         time.sleep(get_check_interval())
@@ -574,14 +761,20 @@ def monitor_loop():
 # MAIN
 # =========================
 def main():
-    if not BEARER_TOKEN or not TELEGRAM_TOKEN or not CHAT_ID:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing required environment variables.")
 
     init_db()
 
+    try:
+        msg = bootstrap_accounts(force=False)
+        print(msg)
+    except Exception as e:
+        upsert_bot_state("last_error", f"BOOTSTRAP: {str(e)[:180]}")
+        print("BOOTSTRAP ERROR:", e)
+
     t1 = threading.Thread(target=poll_telegram, daemon=True)
     t2 = threading.Thread(target=monitor_loop, daemon=True)
-
     t1.start()
     t2.start()
 
