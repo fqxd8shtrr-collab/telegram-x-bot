@@ -2,7 +2,6 @@ import os
 import re
 import time
 import json
-import shlex
 import sqlite3
 import hashlib
 import threading
@@ -15,16 +14,11 @@ import requests
 # ENV
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # وجهة إرسال النتائج
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 CHECK_INTERVAL_DEFAULT = int(os.getenv("CHECK_INTERVAL", "15"))
-CONTROL_CHAT_ID = os.getenv("CONTROL_CHAT_ID", "").strip()  # اختياري: من يتحكم بالبوت فقط
-
-# حسابات twscrape: كل سطر بصيغة:
-# username:password:email:email_password
-# ويمكنك وضع عدة أسطر
+CONTROL_CHAT_ID = os.getenv("CONTROL_CHAT_ID", "").strip()
 ACCOUNTS_TEXT = os.getenv("ACCOUNTS_TEXT", "").strip()
 
-# ملفات محلية
 DB_FILE = "data.db"
 TWS_DB = "accounts.db"
 ACCOUNTS_FILE = "accounts.txt"
@@ -308,7 +302,7 @@ def send_target_video(video_url, caption):
 
 
 # =========================
-# TWSCRAPE HELPERS
+# TWSCRAPE
 # =========================
 def run_cmd(cmd, timeout=180):
     result = subprocess.run(
@@ -338,11 +332,6 @@ def accounts_hash():
 
 
 def bootstrap_accounts(force=False):
-    """
-    يضيف الحسابات من ACCOUNTS_TEXT ويجري login_accounts مرة واحدة عند التغيير.
-    صيغة كل سطر:
-    username:password:email:email_password
-    """
     if not ACCOUNTS_TEXT:
         return "لا توجد حسابات في ACCOUNTS_TEXT."
 
@@ -354,8 +343,7 @@ def bootstrap_accounts(force=False):
 
     write_accounts_file()
 
-    # add_accounts <file_path> <line_format>
-    run_cmd(
+    out1 = run_cmd(
         tws_cmd(
             "add_accounts",
             ACCOUNTS_FILE,
@@ -363,35 +351,29 @@ def bootstrap_accounts(force=False):
         ),
         timeout=300
     )
+    print("ADD_ACCOUNTS OUTPUT:", out1)
 
-    # login_accounts
-    run_cmd(tws_cmd("login_accounts"), timeout=1200)
+    out2 = run_cmd(tws_cmd("login_accounts"), timeout=1200)
+    print("LOGIN_ACCOUNTS OUTPUT:", out2)
 
     upsert_bot_state("accounts_hash", new_hash)
     return "تمت تهيئة الحسابات وتسجيل دخولها."
 
 
 def relogin_failed_accounts():
-    out = run_cmd(tws_cmd("relogin_failed"), timeout=1200)
-    return out or "تم تنفيذ relogin_failed."
+    try:
+        out = run_cmd(tws_cmd("relogin_failed"), timeout=1200)
+        print("RELOGIN OUTPUT:", out)
+        return out or "تم تنفيذ relogin_failed."
+    except Exception as e:
+        print("RELOGIN ERROR:", str(e))
+        return f"RELOGIN ERROR: {str(e)}"
 
 
 def get_accounts_status():
-    """
-    twscrape accounts
-    """
     out = run_cmd(tws_cmd("accounts"), timeout=120)
+    print("ACCOUNTS STATUS OUTPUT:", out)
     return out.strip() or "لا توجد بيانات."
-
-
-def search_x_free(keyword, limit=10):
-    """
-    twscrape search "QUERY" --limit=20
-    الإخراج: JSON lines
-    """
-    query = f'({keyword}) filter:videos'
-    out = run_cmd(tws_cmd("search", query, f"--limit={limit}"), timeout=240)
-    return parse_search_output(out)
 
 
 def parse_search_output(raw_text):
@@ -400,7 +382,7 @@ def parse_search_output(raw_text):
         return []
 
     items = []
-    # أحيانًا يكون JSON array
+
     if raw_text.startswith("["):
         try:
             data = json.loads(raw_text)
@@ -409,7 +391,6 @@ def parse_search_output(raw_text):
         except Exception:
             pass
 
-    # الغالب: JSON لكل سطر
     for line in raw_text.splitlines():
         line = line.strip()
         if not line or not line.startswith("{"):
@@ -419,6 +400,13 @@ def parse_search_output(raw_text):
         except Exception:
             continue
     return items
+
+
+def search_x_free(keyword, limit=10):
+    query = f'({keyword}) filter:videos'
+    out = run_cmd(tws_cmd("search", query, f"--limit={limit}"), timeout=240)
+    print(f"SEARCH OUTPUT [{keyword}]:", out[:2000])
+    return parse_search_output(out)
 
 
 def get_tweet_id(item):
@@ -463,9 +451,6 @@ def get_tweet_url(item):
 
 
 def extract_video_url(item):
-    """
-    يحاول استخراج رابط mp4 مباشر إن كان موجودًا في media.
-    """
     media = item.get("media") or {}
     possible_urls = []
 
@@ -497,7 +482,7 @@ def extract_video_url(item):
 
 
 # =========================
-# BOT UI
+# UI
 # =========================
 def status_text():
     rows = list_keywords()
@@ -630,7 +615,7 @@ def handle_menu_text(chat_id, text):
     if text == "🔐 إعادة تسجيل الفاشلة":
         try:
             out = relogin_failed_accounts()
-            send_message(chat_id, f"تم تنفيذ إعادة تسجيل الفاشلة.\n\n{out[:3500]}", with_menu=True)
+            send_message(chat_id, f"{out[:3500]}", with_menu=True)
         except Exception as e:
             send_message(chat_id, f"فشل إعادة التسجيل:\n{str(e)[:300]}", with_menu=True)
         return
@@ -659,7 +644,7 @@ def handle_menu_text(chat_id, text):
 
 
 # =========================
-# TELEGRAM LOOP
+# LOOPS
 # =========================
 def poll_telegram():
     while True:
@@ -689,9 +674,6 @@ def poll_telegram():
         time.sleep(2)
 
 
-# =========================
-# MONITOR LOOP
-# =========================
 def process_keywords():
     if is_paused():
         return
@@ -707,7 +689,7 @@ def process_keywords():
 
         try:
             tweets = search_x_free(keyword, limit=10)
-            tweets = list(reversed(tweets))  # الأقدم أولًا
+            tweets = list(reversed(tweets))
 
             for item in tweets:
                 post_id = get_tweet_id(item)
